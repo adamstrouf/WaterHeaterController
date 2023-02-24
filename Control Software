@@ -1,0 +1,1758 @@
+[code]
+/*This software is for a water heater controller based on the Arduino NANOevery board with an I2C LCD display 
+  and DS3231 real time clock(RTC) with EEPROM on pins SDA A4, SCL A5, backlight control on pin 6; and a rotary
+  encoder on pins 9 and 10 with a push switch on pin 8. Output to a pilot relay for controlling a  contactor 
+  on pin 2; a solid state relay(SSR) on pin 3; and LED panel on pins 4, 5, and 13. Thermistor analog input
+  for meausering temperature is on pin A0. There is a menu system for adjusting temerature, back light level,
+  run schedule, setting the time and date on the RTC, and manually running the water heater.
+  The controler turns the water heater on and off at the scheduled times; regulates the water temperature when
+  on; displays the date, time, and water temp on the LCD; and diplays the current function on the LED panel.
+
+  Created Jan-Feb 2024
+  By: Adam Strouf
+
+  Based from code by:
+  For using a themistor: lady ada; https://learn.adafruit.com/thermistor/using-a-thermistor
+  For the menu: Author: Fahmi Ghani Date: 5 July 2015 Project: LCD Menu Function Component: LCD Keypad shield
+
+  Libraries:
+  RTClib; 2.1.1; https://github.com/adafruit/RTClib
+  I2C_eeprom; 1.7.1; https://github.com/RobTillaart/I2C_EEPROM
+  Encoder; 1.4.2; https://github.com/PaulStoffregen/Encoder
+  LiquidCrystal_I2C; 2.0; https://github.com/johnrickman/LiquidCrystal_I2C
+  button; 1.0.0; https://github.com/e-tinkers/button
+*/
+
+#include <I2C_eeprom.h>
+#include <button.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <LiquidCrystal_I2C.h>
+#define ENCODER_DO_NOT_USE_INTERRUPTS
+#include <Encoder.h>
+
+
+RTC_DS3231 rtc; // 0x68 Real Time Clock modual.
+LiquidCrystal_I2C lcd(0x27, 16, 2); // set the LCD address to 0x27 for a 16 chars and 2 line display
+Encoder enc1(9, 10); //Rotary encoder with mometary push button switch.
+I2C_eeprom mem(0x57, I2C_DEVICESIZE_24LC32); //0x57 eeprom on RTC modual.
+
+//Constants for pin assignments.
+const int whRelay = 2; //Pin to pilot relay to run water heater contactor.
+const int whOnLed = 4; //Pin to LED to indicate that the waterheater is on.
+const int whSSR = 3; // Pin to SSR to control water heater element.
+const int whHeatLED = 5; //Pin to LED to indicate that the element is on.
+const int bl = 6; //Pin to LCD back light.
+const int powerLED = 13; //Pin to LED to indicate that the arduino has power and error state.
+const int whTemp = A0; //Pin the temperature sensor through the voltage divider.
+
+//Misc. constants.
+const int blStep = 10; // step size for adjusting LCD backlight.
+const int waterRange = 6; //Allowed temperature drift of water in degrees F.
+const int elementTest = 5; //Amount of time to wait in minutes for water to heat before error.
+//2.5gal of water is about 20lbs, and should go from 55 to 110 deg F in about 5 min at 4500 watts input.
+
+//Constants for the thermistors
+const int THERMISTORNOMINAL = 10000; //Resistance value at nominal temp of thermistor
+const int TEMPERATURENOMINAL = 25; // temp. for nominal resistance (almost always 25 C)
+const int NUMSAMPLES = 5; // how many samples to take and average
+const int BCOEFFICIENT = 3950; //B (coefficient) value of thermistor
+const int SERIESRESISTOR = 10000; //Value of fixed resistor
+
+//Encoder variables.
+volatile long pos = 0; //Stores the old position of the encoder.
+volatile long newPos = 0; //Stores the new postion of the encoder.
+
+//Time variables.
+unsigned long startDelay; //Stores the start time for menu time out.
+unsigned long currentDelay; //Stores the current time for menu timout.
+unsigned long ledOff = 0; //Stores the start time for blinking the power LED.
+unsigned long ledOn = 0; //Stores the current time for blinking the power LED.
+unsigned long heatStart = 0; //Stores the start time of the heating element.
+unsigned long heatNow = 0; //Stores the run time of the heating element.
+
+int bLight = 150; //Sets the inital back light level.
+int menuTime; // Timeout period for menu sitting idle in seconds.
+int dayOfWeek; //Stores the day of the week.
+int waterTemp; //Stores the water temperature.
+int samples[NUMSAMPLES]; //Initilizes the arrray to store the samples from the temp. sensor.
+
+bool runDay[7] = {false, false, false, false, false, false, false}; //Array to store run days. Will be set from eeprom on rtc modual starting at address 0.
+bool whOn = false; //State for the operation of the water heater.
+bool whHeat = false; //State of the water heater element.
+bool menuTimeout; //State of the menu timeout.
+bool inMenu = false; //State for if the menu is active.
+bool blChanged; //State for if the back light was changed.
+bool manRun = false; //State for manually running the water heater.
+bool error = false; //State for if in error condition.
+bool highTemp = false; //State for high temp error.
+bool badSensor = false; //State for bad sensor error.
+bool badElement = false; //State for bad element error.
+
+float manRunTime; //Stores time to manually run water heater.
+
+byte mainMenuPage = 1; // Keeps track of location in menu.
+byte mainMenuPageOld = 0; // Used to update the LCD screen.
+byte mainMenuTotal = 7; // Total items in menu for navigation.
+byte waterSetTemp;//Water set temperature, will be set from eeprom on rtc modual at address 100.
+// Array to store run schedule. Will be set from eeprom on rtc modual starting at address 8. 7 days; 2 times (on, off); 3 elements of time (hour, minute, second).
+// The function to set the schedule only sets the hour and minute.
+byte runTimes[7][2][3] = {
+  {{0, 0, 0}, {0, 0, 0}},
+  {{0, 0, 0}, {0, 0, 0}},
+  {{0, 0, 0}, {0, 0, 0}},
+  {{0, 0, 0}, {0, 0, 0}},
+  {{0, 0, 0}, {0, 0, 0}},
+  {{0, 0, 0}, {0, 0, 0}},
+  {{0, 0, 0}, {0, 0, 0}}
+};
+
+char daysOfTheWeek[7][10] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"}; //Array to display day of the week.
+
+//Date time objects to use with the RTC.
+DateTime oldT; //Stores the old time for screen updates.
+DateTime rtcTime; //Stores the current time from the RTC.
+DateTime newDate; //Stores the new date for setting the date.
+DateTime newTime; //Stores the new time for setting the time.
+DateTime manStart; //Stores the date time when starting manual run.
+DateTime manStop;  //Stores the end date time for ending manual run.
+
+
+Button btn1; //Momentary switch on rotary encoder.
+
+void setup () {
+  //Serial.begin(57600); //For testing. 
+  Wire.begin();
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Starting up.");
+
+  if (! rtc.begin())
+    while (1) delay(10);
+
+  if (rtc.lostPower())
+    rtc.adjust(DateTime(2022, 1, 1, 3, 0, 0));
+
+  mem.begin();
+  if (! mem.isConnected())
+    while (1) delay(10);
+
+  btn1.begin(8);
+
+  pinMode(whRelay, OUTPUT);
+  pinMode(whOnLed, OUTPUT);
+  pinMode(whSSR, OUTPUT);
+  pinMode(whHeatLED, OUTPUT);
+  pinMode(powerLED, OUTPUT);
+  pinMode(bl, OUTPUT);
+  pinMode(whTemp, INPUT);
+  digitalWrite(whRelay, LOW);
+  digitalWrite(whOnLed, LOW);
+  digitalWrite(whSSR, LOW);
+  digitalWrite(whHeatLED, LOW);
+  digitalWrite(powerLED, LOW);
+  analogWrite(bl, bLight);
+
+  getSchedule(); //Gets the run schedule and water set temp from memory.
+}//End setup.
+
+void loop () {
+  analogWrite(bl, bLight);
+
+  if (inMenu == false)
+  {
+    lcd.clear();
+    do
+    { mainControl();
+      rtcTime = rtc.now();
+      if (oldT != rtcTime)
+        printDT();
+      oldT = rtcTime;
+      mainMenuPageOld = 0;
+      mainMenuPage = 1;
+      dayOfWeek = rtcTime.dayOfTheWeek();
+      //debugOutput(); //For testing.
+    } while (!btn1.debounce());
+  }
+  inMenu = true;
+  menuDelay(15);
+  if (menuTimeout == true)
+  {
+    menuTimeout = false;
+    startDelay = 0;
+    inMenu = false;
+  }
+  rtcTime = rtc.now();
+  //debugOutput();  //For testing.
+  mainControl();
+  MainMenu();
+}
+
+//Function to turn on and off outputs.
+void mainControl()
+{
+  if (manRun == true && rtcTime < manStop)
+  {
+    whOn = true;
+  }
+
+  if (manRun == true && rtcTime >= manStop)
+  {
+    whOn = false;
+    manRun = false;
+  }
+
+  if (runDay[dayOfWeek] == true && manRun == false)
+  {
+  if (rtcTime >= DateTime(rtcTime.year(), rtcTime.month(), rtcTime.day(), runTimes[dayOfWeek][0][0], runTimes[dayOfWeek][0][1], runTimes[dayOfWeek][0][2]) &&
+      rtcTime <= DateTime(rtcTime.year(), rtcTime.month(), rtcTime.day(), runTimes[dayOfWeek][1][0], runTimes[dayOfWeek][1][1], runTimes[dayOfWeek][1][2]))
+    whOn = true;
+  else
+    whOn = false;
+  }
+   
+  if (manRun == false && runDay[dayOfWeek] == false)
+    whOn = false;
+
+  tempControl();
+
+  if (error != true)
+    digitalWrite (powerLED, HIGH);
+
+  else if (error == true)
+  {
+    ledOn = millis();
+
+    if (highTemp == true)
+    {
+      if (ledOn - ledOff >= 250)
+      {
+        ledOff = ledOn;
+        if (digitalRead(powerLED) == LOW)
+          digitalWrite(powerLED, HIGH);
+        else
+          digitalWrite(powerLED, LOW);
+      }
+    }
+
+    if (badSensor == true)
+    {
+      if (ledOn - ledOff >= 500)
+      {
+        ledOff = ledOn;
+        if (digitalRead(powerLED) == LOW)
+          digitalWrite(powerLED, HIGH);
+        else
+          digitalWrite(powerLED, LOW);
+      }
+    }
+
+    if (badElement == true)
+    {
+      if (ledOn - ledOff >= 1000)
+      {
+        ledOff = ledOn;
+        if (digitalRead(powerLED) == LOW)
+          digitalWrite(powerLED, HIGH);
+        else
+          digitalWrite(powerLED, LOW);
+      }
+    }
+    digitalWrite(whSSR, LOW);
+    digitalWrite(whHeatLED, LOW);
+    digitalWrite(whOnLed, LOW);
+    digitalWrite(whRelay, LOW);
+    return;
+  }
+
+  if (whOn == true)
+  {
+    digitalWrite(whOnLed, HIGH);
+    digitalWrite(whRelay, HIGH);
+  }
+  else
+  {
+    digitalWrite(whOnLed, LOW);
+    digitalWrite(whRelay, LOW);
+  }
+
+  if (whHeat == true)
+  {
+    digitalWrite(whSSR, HIGH);
+    digitalWrite(whHeatLED, HIGH);
+    
+    if (heatStart == heatNow)
+      heatStart = millis();
+    else
+      heatNow = millis();
+  }
+  else
+  {
+    digitalWrite(whSSR, LOW);
+    digitalWrite(whHeatLED, LOW);
+    heatStart = heatNow;
+  }
+}//End of mainControl
+
+//Function to read water temp and turn on or off element.
+void tempControl()
+{
+  waterTemp = getTemp(whTemp);
+
+  if (waterTemp > 170 && waterTemp <= 300)
+  {
+    error = true;
+    highTemp = true;
+    whHeat = false;
+    return;
+  }
+  if (waterTemp < -40 || waterTemp > 300)
+  {
+    error = true;
+    badSensor = true;
+    highTemp = false;
+    whHeat = false;
+    return;
+  }
+
+  if (whOn == true)
+  {
+    if (waterTemp < waterSetTemp - (waterRange / 2))
+      whHeat = true;
+
+    if (heatNow > heatStart && heatNow - heatStart > (elementTest * 60000) && waterTemp < 90)
+    {
+      whHeat = false;
+      error = true;
+      badElement = true;
+    }
+
+    else if (waterTemp >= waterSetTemp + (waterRange / 2))
+      whHeat = false;
+  }
+
+  if (whOn == false)
+    whHeat = false;
+}//End of tempControl.
+
+// Main menu function
+void MainMenu() {
+
+  MainMenuBtn();
+
+  if (btn1.debounce()) //enter selected menu
+  {
+    switch (mainMenuPage)
+    {
+      case 1:
+        inMenu = false;
+        break;
+
+      case 2:
+        manualRun();
+        break;
+
+      case 3:
+        setRunTimes();
+        break;
+
+      case 4:
+        setDate();
+        break;
+
+      case 5:
+        setTime();
+        break;
+
+      case 6:
+        blChanged = true;
+        BackLight();
+        break;
+
+      case 7:
+        setWaterTemp();
+        break;
+    }
+  }
+}//End of MainMenu.
+
+// Prints the menu to the LCD.
+void MainMenuDisplay()
+{
+  char dateBuffer[] = "DDD DD-MMM-YYYY";
+  char timeBuffer[] = "hh:mm:ss";
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  switch (mainMenuPage)
+  {
+    case 1:
+      lcd.print("To Exit Menu:");
+      lcd.setCursor(0, 1);
+      lcd.print("Press Select.");
+      break;
+
+    case 2:
+      lcd.print("Manually turn-");
+      lcd.setCursor(0, 1);
+      lcd.print("on waterheater?");
+      break;
+
+    case 3:
+      lcd.print("Set Schedule?");
+      lcd.setCursor(0, 1);
+      lcd.print("By day and time.");
+      break;
+
+    case 4:
+      lcd.print("Set Date?");
+      lcd.setCursor(0, 1);
+      lcd.print(rtcTime.toString(dateBuffer));
+      break;
+
+    case 5:
+      lcd.print("Set Time?");
+      lcd.setCursor(0, 1);
+      lcd.print(rtcTime.toString(timeBuffer));
+      break;
+
+    case 6:
+      lcd.print("BL Level?");
+      lcd.setCursor(0, 1);
+      lcd.print("Current: ");
+      lcd.print(bLight);
+      break;
+
+    case 7:
+      lcd.print("Set Water Temp?");
+      lcd.setCursor(0, 1);
+      lcd.print("Current: ");
+      lcd.print(waterSetTemp);
+  }
+}// End of MainMenuDisplay.
+
+// Navigates through the menu
+void MainMenuBtn()
+{
+  newPos = enc1.read() / 2;
+
+  if (newPos > pos)
+  {
+    mainMenuPage++;
+    if (mainMenuPage > mainMenuTotal)
+      mainMenuPage = 1;
+    setEnc();
+    startDelay = 0;
+  }
+  else if (newPos < pos)
+  {
+    mainMenuPage--;
+    if (mainMenuPage == 0)
+      mainMenuPage = mainMenuTotal;
+    setEnc();
+    startDelay = 0;
+  }
+
+  if (mainMenuPage != mainMenuPageOld) //only update display when page change
+  {
+    MainMenuDisplay();
+    mainMenuPageOld = mainMenuPage;
+  }
+
+  if (mainMenuPage == 5 && oldT != rtcTime)
+  {
+    MainMenuDisplay();
+    oldT = rtcTime;
+  }
+}// End of MainMenuBtn.
+
+//Menu function to turn on the water heater for specified time period.
+void manualRun()
+{
+  int setConfirm = 0;
+  char confirm[2][4] = {"No", "Yes"};
+  bool changed = true;
+  manRunTime = 0.0;
+  setEnc;
+
+  do
+  {
+    menuDelay(10);
+    if (menuTimeout == true)
+    {
+      startDelay = 0;
+      break;
+    }
+
+    if (changed == true)
+    {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Run Waterheater?");
+      lcd.setCursor(0, 1);
+      lcd.print(confirm[setConfirm]);
+      changed = false;
+    }
+
+    newPos = enc1.read() / 2;
+    if (newPos > pos)
+    {
+      setConfirm++;
+      if (setConfirm > 1)
+        setConfirm = 1;
+      startDelay = 0;
+      changed = true;
+      setEnc();
+    }
+    if (newPos < pos)
+    {
+      setConfirm--;
+      if (setConfirm < 0)
+        setConfirm = 0;
+      startDelay = 0;
+      changed = true;
+      setEnc();
+    }
+  } while (!btn1.debounce());
+
+
+  if (setConfirm == 0 || menuTimeout == true)
+  {
+    manRun = false;
+    mainMenuPageOld = 0;
+    menuTimeout = false;
+    return;
+  }
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Run Waterheater:");
+  lcd.setCursor(0, 1);
+  lcd.print("Time(Hrs):");
+  changed = true;
+  setEnc;
+
+  while (!btn1.debounce())
+  {
+    menuDelay(10);
+    if (menuTimeout == true)
+    {
+      startDelay = 0;
+      mainMenuPageOld = 0;
+      menuTimeout = false;
+      return;
+    }
+
+    if (changed == true)
+    {
+      lcd.setCursor(11, 1);
+      lcd.print(manRunTime);
+      changed = false;
+    }
+
+    newPos = enc1.read() / 2;
+    if (newPos > pos)
+    {
+      manRunTime += .5;
+      manRunTime = min(manRunTime, 12);
+      startDelay = 0;
+      changed = true;
+      setEnc();
+    }
+    if (newPos < pos)
+    {
+      manRunTime -= .5;
+      manRunTime = max(manRunTime, 0);
+      startDelay = 0;
+      changed = true;
+      setEnc();
+    }
+  }
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Run for:");
+  lcd.setCursor(0, 1);
+  lcd.print(manRunTime);
+  lcd.print(" Hours");
+
+  while (!btn1.debounce())
+  {
+    menuDelay(2);
+    if (menuTimeout == true)
+    {
+      menuTimeout = false;
+      startDelay = 0;
+      break;
+    }
+  }
+
+  manRunTime *= 3600;
+  manStart = rtc.now();
+  manStop = manStart + TimeSpan(manRunTime);
+
+  if (!manStop.isValid())
+  {
+    char stopTimeBuff [] = "DD-MMM-YYYY hh:mm:ss";
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Invalid");
+    lcd.setCursor(0, 1);
+    lcd.print(manStop.toString(stopTimeBuff));
+    delay(1500);
+    manRun = false;
+    mainMenuPageOld = 0;
+    return;
+  }
+
+  if (!manStart.isValid())
+  {
+    char startTimeBuff [] = "DD-MMM-YYYY hh:mm:ss";
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Invalid");
+    lcd.setCursor(0, 1);
+    lcd.print(manStart.toString(startTimeBuff));
+    delay(1500);
+    manRun = false;
+    mainMenuPageOld = 0;
+    return;
+  }
+
+  if (manStop == manStart)
+  {
+    manRun = false;
+    mainMenuPageOld = 0;
+    return;
+  }
+
+  manRun = true;
+  mainMenuPageOld = 0;
+}//End of manualRun.
+
+//Menu function to set the water temp.
+void setWaterTemp()
+{
+  byte newSetTemp = waterSetTemp;
+  bool changed = true;
+  int setConfirm = 1;
+  char confirm[2][4] = {"Yes", "No "};
+  setEnc();
+
+  while (!btn1.debounce())
+  {
+    menuDelay(10);
+    if (menuTimeout == true)
+    {
+      startDelay = 0;
+      menuTimeout = false;
+      return;
+    }
+
+    if (changed == true)
+    {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("New water temp:");
+      lcd.setCursor(0, 1);
+      lcd.print("Current:");
+      lcd.print(newSetTemp);
+      changed = false;
+    }
+
+    newPos = enc1.read() / 2;
+    if (newPos > pos)
+    {
+      newSetTemp++;
+      newSetTemp = min(newSetTemp, 150);
+      startDelay = 0;
+      changed = true;
+      setEnc();
+    }
+    if (newPos < pos)
+    {
+      newSetTemp--;
+      newSetTemp = max(newSetTemp, 100);
+      startDelay = 0;
+      changed = true;
+      setEnc();
+    }
+  }
+
+  waterSetTemp = newSetTemp;
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Save to memory?");
+  lcd.setCursor(0, 1);
+  lcd.print("Current:");
+  lcd.print(waterSetTemp);
+
+  do
+  {
+    menuDelay(10);
+    if (menuTimeout == true)
+    {
+      break;
+    }
+    lcd.setCursor(13, 1);
+    lcd.print(confirm[setConfirm]);
+
+    newPos = enc1.read() / 2;
+    if (newPos > pos)
+    {
+      setConfirm++;
+      if (setConfirm > 1)
+        setConfirm = 0;
+      startDelay = 0;
+      setEnc();
+    }
+    if (newPos < pos)
+    {
+      setConfirm--;
+      if (setConfirm < 0)
+        setConfirm = 1;
+      startDelay = 0;
+      setEnc();
+    }
+  } while (!btn1.debounce());
+
+
+  if (setConfirm == 1 || menuTimeout == true)
+  {
+    startDelay = 0;
+    menuTimeout = false;
+    mainMenuPageOld = 0;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Temperature Set");
+    lcd.setCursor(0, 1);
+    lcd.print("but Not Saved!");
+    delay(1000);
+    return;
+  }
+
+  if (setConfirm == 0)
+  {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Temperature Set");
+    lcd.setCursor(0, 1);
+    lcd.print("and Saved!");
+    int test = mem.updateByte(100, waterSetTemp);
+    if (test != 0)
+    {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Error");
+      lcd.setCursor(0, 1);
+      lcd.print(test);
+      delay(1500);
+    }
+    else
+      delay(1000);
+  }
+
+  mainMenuPageOld = 0;
+}//End of setWaterTemp.
+
+//Menu function to set the date.
+void setDate()
+{
+  rtcTime = rtc.now();
+  bool dateChanged;
+  dateChanged = true;
+  int newDay;
+  int newMonth;
+  int newYear;
+  newDay = rtcTime.day();
+  newMonth = rtcTime.month();
+  newYear = rtcTime.year();
+  int setSwitch = 1;
+  int setConfirm = 1;
+  char confirm[2][4] = {"Yes", "No "};
+  setEnc();
+  while (setSwitch <= 4 && menuTimeout == false)
+  {
+    switch (setSwitch)
+    {
+      case 1:
+        while (!btn1.debounce())
+        {
+          menuDelay(10);
+          if (menuTimeout == true)
+          {
+            break;
+          }
+          newDate = DateTime(newYear, newMonth, newDay, 0, 0, 0);
+          char setDateBuff [] = "DD-   -    ";
+          if (dateChanged == true)
+          {
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("New Date");
+            lcd.setCursor(0, 1);
+            lcd.print(newDate.toString(setDateBuff));
+            dateChanged = false;
+          }
+
+          newPos = enc1.read() / 2;
+          if (newPos > pos)
+          {
+            newDay++;
+            newDay = min(newDay, 31);
+            startDelay = 0;
+            dateChanged = true;
+            setEnc();
+          }
+          if (newPos < pos)
+          {
+            newDay--;
+            newDay = max(newDay, 1);
+            startDelay = 0;
+            dateChanged = true;
+            setEnc();
+          }
+        }
+        setSwitch++;
+        dateChanged = true;
+        break;
+
+      case 2:
+        while (!btn1.debounce())
+        {
+          menuDelay(10);
+          if (menuTimeout == true)
+          {
+            break;
+          }
+          newDate = DateTime(newYear, newMonth, newDay, 0, 0, 0);
+          char setDateBuff [] = "  -MMM-    ";
+          if (dateChanged == true)
+          {
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("New Date");
+            lcd.setCursor(0, 1);
+            lcd.print(newDate.toString(setDateBuff));
+            dateChanged = false;
+          }
+
+          newPos = enc1.read() / 2;
+          if (newPos > pos)
+          {
+            newMonth++;
+            newMonth = min(newMonth, 12);
+            startDelay = 0;
+            dateChanged = true;
+            setEnc();
+          }
+          if (newPos < pos)
+          {
+            newMonth--;
+            newMonth = max(newMonth, 1);
+            startDelay = 0;
+            dateChanged = true;
+            setEnc();
+          }
+        }
+        setSwitch++;
+        dateChanged = true;
+        break;
+
+      case 3:
+        while (!btn1.debounce())
+        {
+          menuDelay(10);
+          if (menuTimeout == true)
+          {
+            break;
+          }
+          newDate = DateTime(newYear, newMonth, newDay, 0, 0, 0);
+          char setDateBuff [] = "  -   -YYYY";
+          if (dateChanged == true)
+          {
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("New Date");
+            lcd.setCursor(0, 1);
+            lcd.print(newDate.toString(setDateBuff));
+            dateChanged = false;
+          }
+
+          newPos = enc1.read() / 2;
+          if (newPos > pos)
+          {
+            newYear++;
+            newYear = min(newYear, 2099);
+            startDelay = 0;
+            dateChanged = true;
+            setEnc();
+          }
+          if (newPos < pos)
+          {
+            newYear--;
+            newYear = max(newYear, 2000);
+            startDelay = 0;
+            dateChanged = true;
+            setEnc();
+          }
+        }
+        setSwitch++;
+        break;
+
+      case 4:
+        char setDateBuff [] = "DD-MMM-YYYY";
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Set New Date?");
+        lcd.setCursor(0, 1);
+        lcd.print(newDate.toString(setDateBuff));
+        setEnc;
+        do
+        {
+          menuDelay(10);
+          if (menuTimeout == true)
+          {
+            break;
+          }
+          lcd.setCursor(13, 1);
+          lcd.print(confirm[setConfirm]);
+
+          newPos = enc1.read() / 2;
+          if (newPos > pos)
+          {
+            setConfirm++;
+            if (setConfirm > 1)
+              setConfirm = 0;
+            startDelay = 0;
+            setEnc();
+          }
+          if (newPos < pos)
+          {
+            setConfirm--;
+            if (setConfirm < 0)
+              setConfirm = 1;
+            startDelay = 0;
+            setEnc();
+          }
+        } while (!btn1.debounce());
+        if (setConfirm == 0)
+        {
+          setSwitch++;
+          break;
+        }
+        else if (setConfirm == 1)
+        {
+          setSwitch++;
+          mainMenuPageOld = 0;
+          return;
+        }
+    }
+  }
+
+  if (menuTimeout == true)
+  {
+    menuTimeout = false;
+    startDelay = 0;
+    mainMenuPageOld = 0;
+    return;
+  }
+  rtcTime = rtc.now();
+  newDate = DateTime(newYear, newMonth, newDay, rtcTime.hour(), rtcTime.minute(), rtcTime.second());
+  if (newDate.isValid())
+    rtc.adjust(DateTime(newDate));
+  else if (!newDate.isValid())
+  {
+    char setDateBuff [] = "DD-MMM-YYYY";
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Invalid Date");
+    lcd.setCursor(0, 1);
+    lcd.print(newDate.toString(setDateBuff));
+    delay(1500);
+  }
+  mainMenuPageOld = 0;
+}// End of setDate.
+
+// Menu function to set the time.
+void setTime()
+{
+  rtcTime = rtc.now();
+  bool timeChanged;
+  timeChanged = true;
+  int newHour;
+  int newMin;
+  int newSec;
+  newHour = rtcTime.hour();
+  newMin = rtcTime.minute();
+  newSec = rtcTime.second();
+  int setSwitch = 1;
+  int setConfirm = 1;
+  char confirm[2][4] = {"Yes", "No "};
+  setEnc();
+  while (setSwitch <= 4 && menuTimeout == false)
+  {
+    switch (setSwitch)
+    {
+      case 1:
+        while (!btn1.debounce())
+        {
+          menuDelay(10);
+          if (menuTimeout == true)
+          {
+            break;
+          }
+          newTime = DateTime(0, 0, 0, newHour, newMin, newSec);
+          char setTimeBuff [] = "hh:  :  ";
+          if (timeChanged == true)
+          {
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("New Time");
+            lcd.setCursor(0, 1);
+            lcd.print(newTime.toString(setTimeBuff));
+            timeChanged = false;
+          }
+
+          newPos = enc1.read() / 2;
+          if (newPos > pos)
+          {
+            newHour++;
+            newHour = min(newHour, 23);
+            startDelay = 0;
+            timeChanged = true;
+            setEnc();
+          }
+          if (newPos < pos)
+          {
+            newHour--;
+            newHour = max(newHour, 0);
+            startDelay = 0;
+            timeChanged = true;
+            setEnc();
+          }
+        }
+        setSwitch++;
+        timeChanged = true;
+        break;
+
+      case 2:
+        while (!btn1.debounce())
+        {
+          menuDelay(10);
+          if (menuTimeout == true)
+          {
+            break;
+          }
+          newTime = DateTime(0, 0, 0, newHour, newMin, newSec);
+          char setTimeBuff [] = "  :mm:  ";
+          if (timeChanged == true)
+          {
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("New Time");
+            lcd.setCursor(0, 1);
+            lcd.print(newTime.toString(setTimeBuff));
+            timeChanged = false;
+          }
+
+          newPos = enc1.read() / 2;
+          if (newPos > pos)
+          {
+            newMin++;
+            newMin = min(newMin, 59);
+            startDelay = 0;
+            timeChanged = true;
+            setEnc();
+          }
+          if (newPos < pos)
+          {
+            newMin--;
+            newMin = max(newMin, 0);
+            startDelay = 0;
+            timeChanged = true;
+            setEnc();
+          }
+        }
+        setSwitch++;
+        timeChanged = true;
+        break;
+
+      case 3:
+        while (!btn1.debounce())
+        {
+          menuDelay(10);
+          if (menuTimeout == true)
+          {
+            break;
+          }
+          newTime = DateTime(0, 0, 0, newHour, newMin, newSec);
+          char setTimeBuff [] = "  :  :ss";
+          if (timeChanged == true)
+          {
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("New Time");
+            lcd.setCursor(0, 1);
+            lcd.print(newTime.toString(setTimeBuff));
+            timeChanged = false;
+          }
+
+          newPos = enc1.read() / 2;
+          if (newPos > pos)
+          {
+            newSec++;
+            newSec = min(newSec, 59);
+            startDelay = 0;
+            timeChanged = true;
+            setEnc();
+          }
+          if (newPos < pos)
+          {
+            newSec--;
+            newSec = max(newSec, 0);
+            startDelay = 0;
+            timeChanged = true;
+            setEnc();
+          }
+        }
+        setSwitch++;
+        break;
+
+      case 4:
+        char setTimeBuff [] = "hh:mm:ss";
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Set New Time?");
+        lcd.setCursor(0, 1);
+        lcd.print(newTime.toString(setTimeBuff));
+        setEnc;
+        do
+        {
+          menuDelay(10);
+          if (menuTimeout == true)
+          {
+            break;
+          }
+          lcd.setCursor(13, 1);
+          lcd.print(confirm[setConfirm]);
+
+          newPos = enc1.read() / 2;
+          if (newPos > pos)
+          {
+            setConfirm++;
+            if (setConfirm > 1)
+              setConfirm = 0;
+            startDelay = 0;
+            setEnc();
+          }
+          if (newPos < pos)
+          {
+            setConfirm--;
+            if (setConfirm < 0)
+              setConfirm = 1;
+            startDelay = 0;
+            setEnc();
+          }
+        } while (!btn1.debounce());
+        if (setConfirm == 0)
+        {
+          setSwitch++;
+          break;
+        }
+        else if (setConfirm == 1)
+        {
+          setSwitch++;
+          mainMenuPageOld = 0;
+          return;
+        }
+    }
+  }
+
+  if (menuTimeout == true)
+  {
+    menuTimeout = false;
+    startDelay = 0;
+    mainMenuPageOld = 0;
+    return;
+  }
+  rtcTime = rtc.now();
+  newTime = DateTime(rtcTime.year(), rtcTime.month(), rtcTime.day(), newHour, newMin, newSec);
+  if (newTime.isValid())
+    rtc.adjust(DateTime(newTime));
+  else if (!newTime.isValid())
+  {
+    char setTimeBuff [] = "DD-MMM-YYYY hh:mm:ss";
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Invalid DateTime");
+    lcd.setCursor(0, 1);
+    lcd.print(newTime.toString(setTimeBuff));
+    delay(1500);
+  }
+  mainMenuPageOld = 0;
+}// End of setTime.
+
+//Menu funtion to set the run schedule.
+void setRunTimes()
+{
+  bool changed = true;
+  int hmsSwitch = 0;
+  int highLimit[3] = {23, 59, 59};
+  int setConfirm = 1;
+  char confirm[2][4] = {"Yes", "No "};
+  dayOfWeek = 0;
+  setEnc();
+  while (!btn1.debounce())
+  {
+    if (menuTimeout == true)
+    {
+      menuTimeout == false;
+      mainMenuPageOld = 0;
+      return;
+    }
+
+    while (dayOfWeek < 7)
+    {
+      menuDelay(10);
+      if (menuTimeout == true)
+        break;
+
+      do
+      {
+        menuDelay(10);
+        if (menuTimeout == true)
+        {
+          runDay[dayOfWeek] = false;
+          menuTimeout == false;
+          break;
+        }
+
+        if (changed == true)
+        {
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("Run waterheter:");
+          lcd.setCursor(0, 1);
+          lcd.print(daysOfTheWeek[dayOfWeek]);
+          lcd.setCursor(12, 1);
+
+          if (runDay[dayOfWeek] == false)
+            lcd.print("NO");
+          if (runDay[dayOfWeek] == true)
+            lcd.print("YES");
+
+          changed = false;
+        }
+        newPos = enc1.read() / 2;
+        if (newPos > pos)
+        {
+          if (runDay[dayOfWeek] == true)
+            runDay[dayOfWeek] = false;
+          if (runDay[dayOfWeek] == false)
+            runDay[dayOfWeek] = true;
+          startDelay = 0;
+          changed = true;
+          setEnc();
+        }
+        if (newPos < pos)
+        {
+          if (runDay[dayOfWeek] == false)
+            runDay[dayOfWeek] = true;
+          if (runDay[dayOfWeek] == true)
+            runDay[dayOfWeek] = false;
+          startDelay = 0;
+          changed = true;
+          setEnc();
+        }
+      } while (!btn1.debounce());
+      startDelay = 0;
+      changed = true;
+
+      if (runDay[dayOfWeek] == false)
+      {
+        dayOfWeek++;
+        break;
+      }
+
+      while (hmsSwitch <= 1)
+      {
+        menuDelay(10);
+        if (menuTimeout == true)
+          break;
+
+        do
+        {
+          menuDelay(10);
+          if (menuTimeout == true)
+          {
+            menuTimeout == false;
+            break;
+          }
+
+          char setTimeBuff [10];
+
+          if (changed == true)
+          {
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print(daysOfTheWeek[dayOfWeek]);
+            lcd.setCursor(0, 1);
+            lcd.print("On:");
+            if (hmsSwitch == 0)
+            {
+              lcd.setCursor(7, 1);
+              lcd.print((char)62);
+            }
+            if (hmsSwitch == 1)
+            {
+              lcd.setCursor(13, 1);
+              lcd.print((char)60);
+            }
+            lcd.setCursor(8, 1);
+            sprintf (setTimeBuff, "%02u:%02u", runTimes[dayOfWeek][0][0], runTimes[dayOfWeek][0][1]);
+            lcd.print(setTimeBuff);
+            changed = false;
+          }
+
+          newPos = enc1.read() / 2;
+          if (newPos > pos)
+          {
+            runTimes[dayOfWeek][0][hmsSwitch]++;
+            runTimes[dayOfWeek][0][hmsSwitch] = min(runTimes[dayOfWeek][0][hmsSwitch], highLimit[hmsSwitch]);
+            startDelay = 0;
+            changed = true;
+            setEnc();
+          }
+          if (newPos < pos)
+          {
+            runTimes[dayOfWeek][0][hmsSwitch]--;
+            runTimes[dayOfWeek][0][hmsSwitch] = max(runTimes[dayOfWeek][0][hmsSwitch], 0);
+            startDelay = 0;
+            changed = true;
+            setEnc();
+          }
+        } while (!btn1.debounce());
+        hmsSwitch++;
+        changed = true;
+      }
+
+      hmsSwitch = 0;
+      while (hmsSwitch <= 1)
+      {
+        menuDelay(10);
+        if (menuTimeout == true)
+          break;
+
+        do
+        {
+          menuDelay(10);
+          if (menuTimeout == true)
+          {
+            menuTimeout == false;
+            break;
+          }
+
+          char setTimeBuff [6];
+
+          if (changed == true)
+          {
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print(daysOfTheWeek[dayOfWeek]);
+            lcd.setCursor(0, 1);
+            lcd.print("Off:");
+            if (hmsSwitch == 0)
+            {
+              lcd.setCursor(7, 1);
+              lcd.print((char)62);
+            }
+            if (hmsSwitch == 1)
+            {
+              lcd.setCursor(13, 1);
+              lcd.print((char)60);
+            }
+            lcd.setCursor(8, 1);
+            sprintf (setTimeBuff, "%02u:%02u", runTimes[dayOfWeek][1][0], runTimes[dayOfWeek][1][1]);
+            lcd.print(setTimeBuff);
+            changed = false;
+          }
+
+          newPos = enc1.read() / 2;
+          if (newPos > pos)
+          {
+            runTimes[dayOfWeek][1][hmsSwitch]++;
+            runTimes[dayOfWeek][1][hmsSwitch] = min(runTimes[dayOfWeek][1][hmsSwitch], highLimit[hmsSwitch]);
+            startDelay = 0;
+            changed = true;
+            setEnc();
+          }
+          if (newPos < pos)
+          {
+            runTimes[dayOfWeek][1][hmsSwitch]--;
+            runTimes[dayOfWeek][1][hmsSwitch] = max(runTimes[dayOfWeek][1][hmsSwitch], 0);
+            startDelay = 0;
+            changed = true;
+            setEnc();
+          }
+        } while (!btn1.debounce());
+        hmsSwitch++;
+        changed = true;
+      }
+      hmsSwitch = 0;
+      dayOfWeek++;
+    }
+    if (dayOfWeek >= 7)
+      break;
+  }
+  changed = true;
+  setEnc();
+
+  do
+  {
+    menuDelay(10);
+    if (menuTimeout == true)
+    {
+      break;
+    }
+
+    if (changed == true)
+    {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Save to memory?");
+      lcd.setCursor(6, 1);
+      lcd.print(confirm[setConfirm]);
+      changed = false;
+    }
+
+    newPos = enc1.read() / 2;
+    if (newPos > pos)
+    {
+      setConfirm++;
+      if (setConfirm > 1)
+        setConfirm = 0;
+      startDelay = 0;
+      changed = true;
+      setEnc();
+    }
+    if (newPos < pos)
+    {
+      setConfirm--;
+      if (setConfirm < 0)
+        setConfirm = 1;
+      startDelay = 0;
+      changed = true;
+      setEnc();
+    }
+  } while (!btn1.debounce());
+
+
+  if (setConfirm == 1 || menuTimeout == true)
+  {
+    startDelay = 0;
+    menuTimeout = false;
+    mainMenuPageOld = 0;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Schedule Set");
+    lcd.setCursor(0, 1);
+    lcd.print("but Not Saved!");
+    delay(1000);
+    return;
+  }
+
+  if (setConfirm == 0)
+  {
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Schedule Set");
+    lcd.setCursor(0, 1);
+    lcd.print("and Saved!");
+    saveSchedule();
+    delay(1000);
+  }
+  mainMenuPageOld = 0;
+}//End of setRunTimes.
+
+//Function to save schedule to eeprom.
+void saveSchedule()
+{
+  dayOfWeek = 0;
+  int ssSwitch = 0;
+  int hmsSwitch = 0;
+  int test;
+
+  for (int address = 0; address < 7; address++)
+  {
+    test = mem.updateByte(address, runDay[dayOfWeek]);
+    if (test != 0)
+    {
+      while (!btn1.debounce())
+      {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Error: ");
+        lcd.print(runDay[dayOfWeek]);
+        lcd.setCursor(0, 1);
+        lcd.print("Code: ");
+        lcd.print(test);
+      }
+      return;
+    }
+    else
+      dayOfWeek++;
+  }
+
+  dayOfWeek = 0;
+  for (int address = 8; address < 50; address++)
+  {
+    test = mem.updateByte(address, runTimes[dayOfWeek][ssSwitch][hmsSwitch]);
+
+    if (test != 0)
+    {
+      while (!btn1.debounce())
+      {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Error: ");
+        lcd.print(runTimes[dayOfWeek][ssSwitch][hmsSwitch]);
+        lcd.setCursor(0, 1);
+        lcd.print("Code: ");
+        lcd.print(test);
+      }
+      return;
+    }
+    else;
+
+    if (hmsSwitch < 2)
+      hmsSwitch++;
+    else if (hmsSwitch == 2 && ssSwitch == 0)
+    {
+      ssSwitch++;
+      hmsSwitch = 0;
+    }
+    else if (hmsSwitch == 2 && ssSwitch == 1)
+    {
+      dayOfWeek++;
+      hmsSwitch = 0;
+      ssSwitch = 0;
+    }
+  }
+}// End of saveSchedule.
+
+//Reads eeprom to set saved values for waterTemp, runDay, and runTimes.
+void getSchedule()
+{
+  dayOfWeek = 0;
+  int ssSwitch = 0;
+  int hmsSwitch = 0;
+
+  waterSetTemp = mem.readByte(100);
+
+  for (int address = 0; address < 7; address++)
+  {
+    runDay[dayOfWeek] = mem.readByte(address);
+    dayOfWeek++;
+  }
+
+  dayOfWeek = 0;
+  for (int address = 8; address < 50; address++)
+  {
+    runTimes[dayOfWeek][ssSwitch][hmsSwitch] = mem.readByte(address);
+    if (hmsSwitch < 2)
+      hmsSwitch++;
+    else if (hmsSwitch == 2 && ssSwitch == 0)
+    {
+      ssSwitch++;
+      hmsSwitch = 0;
+    }
+    else if (hmsSwitch == 2 && ssSwitch == 1)
+    {
+      dayOfWeek++;
+      hmsSwitch = 0;
+      ssSwitch = 0;
+    }
+  }
+}//End of getSchedule.
+
+// Menu function to set the backlight level.
+void BackLight()
+{
+  int newBL = bLight;
+  setEnc();
+
+  while (!btn1.debounce())
+  {
+    menuDelay(10);
+    if (menuTimeout == true)
+    {
+      newBL = bLight;
+      menuTimeout = false;
+      startDelay = 0;
+      break;
+    }
+
+    if (blChanged == true)
+    {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("BL Level: ");
+      lcd.print(newBL);
+      lcd.setCursor(0, 1);
+      lcd.print("Current: ");
+      lcd.print(bLight);
+      blChanged = false;
+    }
+
+    newPos = enc1.read() / 2;
+
+    if (newPos > pos)
+    {
+      newBL += blStep;
+      newBL = min(newBL, 250);
+      startDelay = 0;
+      blChanged = true;
+      setEnc();
+    }
+    if (newPos < pos)
+    {
+      newBL -= blStep;
+      newBL = max(newBL, 0);
+      startDelay = 0;
+      blChanged = true;
+      setEnc();
+    }
+  }
+  bLight = newBL;
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("BL Level: ");
+  lcd.print(newBL);
+  lcd.setCursor(0, 1);
+  lcd.print("Current: ");
+  lcd.print(bLight);
+
+  while (!btn1.debounce())
+  {
+    menuDelay(2);
+    if (menuTimeout == true)
+    {
+      menuTimeout = false;
+      startDelay = 0;
+      break;
+    }
+  }
+  mainMenuPageOld = 0;
+}// End of backlight.
+
+// Function to exit menu after a called time in seconds.
+void menuDelay(int menuTime)
+{
+  if (startDelay == 0)
+    startDelay = millis();
+
+  currentDelay = millis();
+
+  if (currentDelay >= startDelay + (menuTime * 1000))
+  {
+    menuTimeout = true;
+  }
+}// End of menuDelay.
+
+// This reads the specific temp sensor assinged when called and converts it to a temperature.
+int getTemp(int sensor)
+{
+  uint8_t i;
+  float average;
+
+  // take N samples in a row, with a slight delay
+  for (i = 0; i < NUMSAMPLES; i++) {
+    samples[i] = analogRead(sensor);
+    delay(5);
+  }
+
+  // get the average of all the samples
+  average = 0;
+  for (i = 0; i < NUMSAMPLES; i++) {
+    average += samples[i];
+  }
+  average /= NUMSAMPLES;
+
+  // convert the value to resistance
+  average = 1023 / average - 1;
+  average = SERIESRESISTOR / average;
+
+  // convert resistance to temperature
+  float steinhart;
+  steinhart = average / THERMISTORNOMINAL;     // (R/Ro)
+  steinhart = log(steinhart);                  // ln(R/Ro)
+  steinhart /= BCOEFFICIENT;                   // 1/B * ln(R/Ro)
+  steinhart += 1.0 / (TEMPERATURENOMINAL + 273.15); // + (1/To)
+  steinhart = 1.0 / steinhart;                 // Invert
+  steinhart -= 273.15;                         // convert to C
+  steinhart = steinhart * 1.8 + 32;           // convert to F
+
+  return steinhart;
+}// End of getTemp.
+
+// Prints the date and time.
+void printDT ()
+{
+  char dateBuffer[] = "DDD DD-MMM-YYYY";
+  char timeBuffer[] = "hh:mm:ss";
+  char tempBuff[6];
+  lcd.setCursor(0, 0);
+  lcd.print(rtcTime.toString(dateBuffer));
+  lcd.setCursor(0, 1);
+  lcd.print(rtcTime.toString(timeBuffer));
+  lcd.setCursor(11, 1);
+  sprintf (tempBuff, "%3u%cF", waterTemp, (char)223);
+  lcd.print(tempBuff);
+} // End of printDT.
+
+//Sets the encoder variabes equal.
+void setEnc()
+{
+  pos = enc1.read() / 2;
+  newPos = enc1.read() / 2;
+}// End of setEnc.
+
+//For testing.
+
+/*void debugOutput() {
+  Serial.print("Water: ");
+  Serial.print(waterTemp);
+  Serial.print("    ");
+  Serial.print(heatStart);
+  Serial.print(" - ");
+  Serial.print(heatNow);
+  Serial.print("    ");
+  Serial.print("wh on ");
+  Serial.print(whOn);
+  Serial.print("    ");
+  Serial.print("error ");
+  //Serial.print("\t");
+  Serial.print(error);
+  Serial.print("    ");
+  Serial.print("h temp ");
+  //Serial.print("\t");
+  Serial.print(highTemp);
+  Serial.print("    ");
+  Serial.print("bad sen ");
+  //Serial.print("\t");
+  Serial.print(badSensor);
+  Serial.print("\t");
+  char tdBuff[] = "DD-MMM-YYYY hh:mm:ss";
+  char tdStopBuff[] = "DD-MMM-YYYY hh:mm:ss";
+  Serial.print(manStart.toString(tdBuff));
+  Serial.print("\t");
+  Serial.print(manStop.toString(tdStopBuff));
+  Serial.print("\t");
+  Serial.print(manRunTime);
+  Serial.println();
+}*/
+[/code]
